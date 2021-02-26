@@ -655,9 +655,6 @@ static int hwsched_sendcmds(struct adreno_device *adreno_dev,
 			break;
 		}
 
-		if (cmdobj)
-			drawctxt->submitted_timestamp = drawobj->timestamp;
-
 		count++;
 	}
 
@@ -897,7 +894,6 @@ static void _queue_drawobj(struct adreno_context *drawctxt,
 		pid_nr(context->proc_priv->pid),
 		context->id, drawobj->timestamp,
 		!!(drawobj->flags & KGSL_DRAWOBJ_END_OF_FRAME));
-	trace_adreno_cmdbatch_queued(drawobj, drawctxt->queued);
 }
 
 static int _queue_cmdobj(struct adreno_device *adreno_dev,
