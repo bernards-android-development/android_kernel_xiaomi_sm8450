@@ -291,7 +291,6 @@ static struct kgsl_mem_entry *kgsl_mem_entry_create(void)
 
 static void add_dmabuf_list(struct kgsl_dma_buf_meta *metadata)
 {
-	struct kgsl_device *device = dev_get_drvdata(metadata->attach->dev);
 	struct dmabuf_list_entry *dle;
 	struct page *page;
 
