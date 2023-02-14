@@ -8,6 +8,8 @@
 
 #include "kgsl_snapshot.h"
 
+#if 0
+
 #define CP_CRASH_DUMPER_TIMEOUT 500
 
 #define DEBUG_SECTION_SZ(_dwords) (((_dwords) * sizeof(unsigned int)) \
@@ -119,6 +121,7 @@ void adreno_parse_ib_lpac(struct kgsl_device *device,
  */
 size_t adreno_snapshot_global(struct kgsl_device *device, u8 *buf,
 	size_t remain, void *priv);
+<<<<<<< HEAD
 
 /**
  * adreno_snapshot_dump_all_ibs - To dump all ibs from ringbuffer
@@ -132,4 +135,7 @@ void adreno_snapshot_dump_all_ibs(struct kgsl_device *device,
 			unsigned int *rbptr,
 			struct kgsl_snapshot *snapshot);
 
+=======
+#endif
+>>>>>>> c7ecd7c35ae2 (msm: kgsl: disable snapshot, coresight and trace)
 #endif /*__ADRENO_SNAPSHOT_H */
