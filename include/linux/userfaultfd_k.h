@@ -75,6 +75,10 @@ extern ssize_t mcopy_continue(struct mm_struct *dst_mm, unsigned long dst_start,
 extern int mwriteprotect_range(struct mm_struct *dst_mm,
 			       unsigned long start, unsigned long len,
 			       bool enable_wp, bool *mmap_changing);
+extern ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
+			  unsigned long dst_start, unsigned long src_start,
+			  unsigned long len, __u64 mode,
+			  bool *mmap_changing);
 
 /* mm helpers */
 static inline bool is_mergeable_vm_userfaultfd_ctx(struct vm_area_struct *vma,
