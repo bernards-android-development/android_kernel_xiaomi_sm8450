@@ -2976,7 +2976,7 @@ retry:
 		err = -ETIMEDOUT;
 		dev_dbg(hba->dev, "%s: dev_cmd request timedout, tag %d\n",
 			__func__, lrbp->task_tag);
-		if (!ufshcd_clear_cmds(hba, 1U << lrbp->task_tag))
+		if (!ufshcd_clear_cmds(hba, 1U << lrbp->task_tag)) {
 			/* successfully cleared the command, retry if needed */
 			err = -EAGAIN;
 			/*
