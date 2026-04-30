@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
-
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <linux/vmalloc.h>
 #include <linux/zstd.h>
 
 #include "backend_zstd.h"
+
+#define DEFAULT_CLEVEL 1
 
 struct zstd_ctx {
 	zstd_cctx *cctx;
@@ -42,7 +43,7 @@ static int zstd_setup_params(struct zcomp_params *params)
 		return -ENOMEM;
 
 	params->drv_data = zp;
-	level = (params->level == ZCOMP_PARAM_NO_LEVEL) ? 3 : params->level;
+	level = (params->level == ZCOMP_PARAM_NO_LEVEL) ? DEFAULT_CLEVEL : params->level;
 	params->level = level;
 
 	zp->cprm = zstd_get_params(level, PAGE_SIZE);
@@ -78,7 +79,7 @@ static int zstd_create(struct zcomp_params *params, struct zcomp_ctx *ctx)
 		return -ENOMEM;
 
 	ctx->context = zctx;
-	level = (params->level == ZCOMP_PARAM_NO_LEVEL) ? 3 : params->level;
+	level = (params->level == ZCOMP_PARAM_NO_LEVEL) ? DEFAULT_CLEVEL : params->level;
 
 	prm = zstd_get_params(level, PAGE_SIZE);
 
