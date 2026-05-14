@@ -2000,8 +2000,11 @@ static int userfaultfd_move(struct userfaultfd_ctx *ctx, unsigned long arg)
 	user_uffdio_move = (struct uffdio_move __user *)arg;
 
 	ret = -EAGAIN;
-	if (READ_ONCE(ctx->mmap_changing))
+	if (unlikely(READ_ONCE(ctx->mmap_changing))) {
+		if (unlikely(put_user(ret, &user_uffdio_move->move)))
+			return -EFAULT;
 		goto out;
+	}
 
 	ret = -EFAULT;
 	if (copy_from_user(&uffdio_move, user_uffdio_move,
