@@ -932,6 +932,135 @@ static bool uffd_move_is_target_task(struct task_struct *task)
 	} while (0)
 #endif
 
+#ifdef CONFIG_SWAP
+static int move_swap_pte(struct mm_struct *mm,
+			 struct vm_area_struct *dst_vma,
+			 struct vm_area_struct *src_vma,
+			 pmd_t *dst_pmd, pmd_t *src_pmd,
+			 unsigned long dst_addr, unsigned long src_addr,
+			 pte_t orig_src_pte, const char **fail_reason)
+{
+	swp_entry_t entry;
+	struct swap_info_struct *si;
+	struct page *page;
+	unsigned long offset;
+	pte_t *dst_pte = NULL, *src_pte = NULL;
+	spinlock_t *dst_ptl, *src_ptl;
+	pte_t moved_pte;
+	int ret = -EBUSY;
+
+	if (fail_reason)
+		*fail_reason = "src_pte_not_present";
+
+	if (!dst_vma->anon_vma) {
+		if (fail_reason)
+			*fail_reason = "swap_dst_anon_vma_missing";
+		return -EBUSY;
+	}
+
+	if (!is_swap_pte(orig_src_pte)) {
+		if (fail_reason)
+			*fail_reason = "src_pte_non_swap";
+		return -EBUSY;
+	}
+
+	entry = pte_to_swp_entry(orig_src_pte);
+	if (non_swap_entry(entry)) {
+		if (fail_reason)
+			*fail_reason = "src_pte_non_swap_entry";
+		return -EBUSY;
+	}
+
+	if (swp_swapcount(entry) != 1) {
+		if (fail_reason)
+			*fail_reason = "swap_entry_not_exclusive";
+		return -EBUSY;
+	}
+
+	page = lookup_swap_cache(entry, src_vma, src_addr);
+	if (page) {
+		put_page(page);
+		if (fail_reason)
+			*fail_reason = "swapcache_page_present";
+		return -EBUSY;
+	}
+
+	si = get_swap_device(entry);
+	if (!si) {
+		if (fail_reason)
+			*fail_reason = "swap_device_missing";
+		return -EBUSY;
+	}
+	offset = swp_offset(entry);
+	if (READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE) {
+		put_swap_device(si);
+		if (fail_reason)
+			*fail_reason = "swapcache_race_has_cache";
+		return -EBUSY;
+	}
+
+	dst_pte = pte_offset_map(dst_pmd, dst_addr);
+	src_pte = pte_offset_map(src_pmd, src_addr);
+	if (!dst_pte || !src_pte) {
+		ret = -EFAULT;
+		if (fail_reason)
+			*fail_reason = "swap_pte_offset_map";
+		goto out_unmap;
+	}
+
+	dst_ptl = pte_lockptr(mm, dst_pmd);
+	src_ptl = pte_lockptr(mm, src_pmd);
+	uffd_double_pt_lock(dst_ptl, src_ptl);
+
+	if (!pte_same(*src_pte, orig_src_pte)) {
+		if (fail_reason)
+			*fail_reason = "swap_src_pte_changed";
+		goto out_unlock;
+	}
+	if (!pte_none(*dst_pte)) {
+		if (fail_reason)
+			*fail_reason = "swap_dst_pte_not_none";
+		goto out_unlock;
+	}
+
+	moved_pte = ptep_get_and_clear(mm, src_addr, src_pte);
+	set_pte_at(mm, dst_addr, dst_pte, moved_pte);
+	ret = 0;
+
+out_unlock:
+	uffd_double_pt_unlock(dst_ptl, src_ptl);
+out_unmap:
+	if (src_pte)
+		pte_unmap(src_pte);
+	if (dst_pte)
+		pte_unmap(dst_pte);
+	put_swap_device(si);
+	return ret;
+}
+
+#else
+static int move_swap_pte(struct mm_struct *mm,
+			 struct vm_area_struct *dst_vma,
+			 struct vm_area_struct *src_vma,
+			 pmd_t *dst_pmd, pmd_t *src_pmd,
+			 unsigned long dst_addr, unsigned long src_addr,
+			 pte_t orig_src_pte, const char **fail_reason)
+{
+	(void)mm;
+	(void)dst_vma;
+	(void)src_vma;
+	(void)dst_pmd;
+	(void)src_pmd;
+	(void)dst_addr;
+	(void)src_addr;
+	(void)orig_src_pte;
+
+	if (fail_reason)
+		*fail_reason = "swap_disabled";
+	return -EBUSY;
+}
+#endif
+
 static int validate_move_areas(struct userfaultfd_ctx *ctx,
 			       struct vm_area_struct *src_vma,
 			       struct vm_area_struct *dst_vma)
@@ -1120,11 +1249,16 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		pte_t *dst_pte, *src_pte;
 		spinlock_t *dst_ptl, *src_ptl;
 		pte_t orig_dst_pte, orig_src_pte, moved_pte;
+		pte_t swap_src_pte = __pte(0);
 		struct page *page;
-		bool copied;
+		bool copied, try_swap_pte;
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+		const char *swap_fail_reason = "src_pte_not_present";
+#endif
 		dst_pte = NULL;
 		src_pte = NULL;
 		copied = false;
+		try_swap_pte = false;
 
 		if (fatal_signal_pending(current)) {
 			err = -EINTR;
@@ -1238,10 +1372,9 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 			goto out_unlock_pt;
 		}
 		if (!pte_present(orig_src_pte)) {
-			err = -EBUSY;
-			UFFD_MOVE_RECORD_FAIL("src_pte_not_present", dst_addr, src_addr);
-			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail src_pte_not_present dst=%#lx src=%#lx ret=%zd\n",
-					     dst_addr, src_addr, err);
+			swap_src_pte = orig_src_pte;
+			try_swap_pte = true;
+			err = 0;
 			goto out_unlock_pt;
 		}
 
@@ -1346,6 +1479,30 @@ out_unmap:
 			pte_unmap(src_pte);
 		if (dst_pte)
 			pte_unmap(dst_pte);
+
+		if (try_swap_pte) {
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+			err = move_swap_pte(mm, dst_vma, src_vma, dst_pmd, src_pmd,
+					    dst_addr, src_addr, swap_src_pte,
+					    &swap_fail_reason);
+#else
+			err = move_swap_pte(mm, dst_vma, src_vma, dst_pmd, src_pmd,
+					    dst_addr, src_addr, swap_src_pte, NULL);
+#endif
+			if (!err) {
+				copied = true;
+				UFFD_MOVE_FAIL_LOG("uffd_move: move_pages swap_pte_moved dst=%#lx src=%#lx\n",
+						  dst_addr, src_addr);
+			} else {
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+				UFFD_MOVE_RECORD_FAIL(swap_fail_reason, dst_addr, src_addr);
+				UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail %s dst=%#lx src=%#lx ret=%zd\n",
+						  swap_fail_reason, dst_addr, src_addr, err);
+#else
+				UFFD_MOVE_RECORD_FAIL("src_pte_not_present", dst_addr, src_addr);
+#endif
+			}
+		}
 
 		if (copied) {
 			moved += PAGE_SIZE;
