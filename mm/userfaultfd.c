@@ -571,6 +571,24 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
 	long copied;
 	struct page *page;
 	bool wp_copy;
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+	unsigned long last_dst = dst_start;
+	unsigned long last_src = src_start;
+#else
+	unsigned long last_dst = 0;
+	unsigned long last_src = 0;
+#endif
+
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+#define UFFD_COPY_LOG(_fmt, ...)						\
+	do {							\
+		pr_err_ratelimited(_fmt, ##__VA_ARGS__);		\
+	} while (0)
+#else
+#define UFFD_COPY_LOG(_fmt, ...)						\
+	do {							\
+	} while (0)
+#endif
 
 	/*
 	 * Sanitize the command parameters:
@@ -589,8 +607,28 @@ static __always_inline ssize_t __mcopy_atomic(struct mm_struct *dst_mm,
 retry:
 	err = -EAGAIN;
 	if (mode & UFFDIO_MODE_MMAP_TRYLOCK) {
-		if (!mmap_read_trylock(dst_mm))
-			goto out;
+		if (!mmap_read_trylock(dst_mm)) {
+			if (len == PAGE_SIZE) {
+				/*
+				 * ART uses single-page COPY as the MOVE fallback.
+				 * Avoid returning zero-progress -EAGAIN for that
+				 * path; it can otherwise retry the same page forever.
+				 */
+				UFFD_COPY_LOG("uffd_copy: __mcopy_atomic fallback reason=trylock_single_page_blocking mm=%px pid=%d tgid=%d dst=%#lx src=%#lx len=%#lx mode=%#llx copied=%ld\n",
+					      dst_mm, current->pid, current->tgid,
+					      dst_start, src_start, len,
+					      (unsigned long long)mode, copied);
+				mmap_read_lock(dst_mm);
+			} else {
+				UFFD_COPY_LOG("uffd_copy: __mcopy_atomic fail reason=%s mm=%px pid=%d tgid=%d dst=%#lx src=%#lx len=%#lx mode=%#llx copied=%ld ret=%d\n",
+					      copied ? "trylock_eagain_after_progress" :
+						       "trylock_eagain_zero_progress",
+					      dst_mm, current->pid, current->tgid,
+					      dst_start, src_start, len,
+					      (unsigned long long)mode, copied, -EAGAIN);
+				goto out;
+			}
+		}
 	} else {
 		mmap_read_lock(dst_mm);
 	}
@@ -600,8 +638,13 @@ retry:
 	 * operation (e.g. mremap) running in parallel, bail out and
 	 * request the user to retry later
 	 */
-	if (mmap_changing && READ_ONCE(*mmap_changing))
+	if (mmap_changing && READ_ONCE(*mmap_changing)) {
+		UFFD_COPY_LOG("uffd_copy: __mcopy_atomic fail reason=mmap_changing mm=%px pid=%d tgid=%d dst=%#lx src=%#lx len=%#lx mode=%#llx copied=%ld ret=%d\n",
+			      dst_mm, current->pid, current->tgid,
+			      dst_start, src_start, len,
+			      (unsigned long long)mode, copied, -EAGAIN);
 		goto out_unlock;
+	}
 
 	/*
 	 * Make sure the vma is not shared, that the dst range is
@@ -723,12 +766,20 @@ retry:
 			dst_addr += PAGE_SIZE;
 			src_addr += PAGE_SIZE;
 			copied += PAGE_SIZE;
+			last_dst = dst_addr - PAGE_SIZE;
+			last_src = src_addr - PAGE_SIZE;
 
 			if (fatal_signal_pending(current))
 				err = -EINTR;
 
-			if (mmap_lock_is_contended(dst_mm))
+			if (mmap_lock_is_contended(dst_mm)) {
 				err = -EAGAIN;
+				UFFD_COPY_LOG("uffd_copy: __mcopy_atomic fail reason=contention_after_progress mm=%px pid=%d tgid=%d dst=%#lx src=%#lx len=%#lx mode=%#llx copied=%ld last_dst=%#lx last_src=%#lx ret=%d\n",
+					      dst_mm, current->pid, current->tgid,
+					      dst_start, src_start, len,
+					      (unsigned long long)mode, copied,
+					      last_dst, last_src, -EAGAIN);
+			}
 		}
 		if (err)
 			break;
@@ -742,6 +793,18 @@ out:
 	BUG_ON(copied < 0);
 	BUG_ON(err > 0);
 	BUG_ON(!copied && !err);
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+	if (err || (unsigned long)copied != len) {
+		ssize_t returned = copied ? copied : err;
+
+		UFFD_COPY_LOG("uffd_copy: __mcopy_atomic exit mm=%px pid=%d tgid=%d dst=%#lx src=%#lx len=%#lx mode=%#llx copied=%ld err=%zd returned=%zd last_dst=%#lx last_src=%#lx\n",
+			      dst_mm, current->pid, current->tgid,
+			      dst_start, src_start, len,
+			      (unsigned long long)mode, copied, err, returned,
+			      last_dst, last_src);
+	}
+#endif
+#undef UFFD_COPY_LOG
 	return copied ? copied : err;
 }
 
@@ -796,35 +859,183 @@ static inline bool vma_move_compatible(struct vm_area_struct *vma)
 	return !(vma->vm_flags & (VM_PFNMAP | VM_IO | VM_HUGETLB | VM_MIXEDMAP));
 }
 
+#define UFFD_MOVE_VALIDATE_META_FMT \
+	" src_vma=%px dst_vma=%px src=[%#lx-%#lx) dst=[%#lx-%#lx)" \
+	" src_anon_vma=%px dst_anon_vma=%px ctx=%px dst_ctx=%px"
+#define UFFD_MOVE_FAIL_CTX_FMT \
+	" mm=%px pid=%d tgid=%d dst_start=%#lx src_start=%#lx len=%#lx"
+
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+#define UFFD_MOVE_SUMMARY_EVERY 256
+static atomic64_t uffd_move_summary_calls = ATOMIC64_INIT(0);
+static atomic64_t uffd_move_summary_success_pages = ATOMIC64_INIT(0);
+static atomic64_t uffd_move_summary_partial_calls = ATOMIC64_INIT(0);
+static atomic64_t uffd_move_summary_fail_calls = ATOMIC64_INIT(0);
+static atomic_t uffd_move_target_tgid = ATOMIC_INIT(-1);
+
+#define UFFD_MOVE_TARGET_TOKEN "coolapk"
+
+static bool uffd_move_comm_has_token(const char *comm, const char *token)
+{
+	size_t i, j;
+
+	if (!comm || !token || !token[0])
+		return false;
+
+	for (i = 0; i < TASK_COMM_LEN && comm[i]; i++) {
+		for (j = 0; token[j] && i + j < TASK_COMM_LEN &&
+		     comm[i + j] == token[j]; j++)
+			;
+		if (!token[j])
+			return true;
+	}
+
+	return false;
+}
+
+static bool uffd_move_is_target_task(struct task_struct *task)
+{
+	int target_tgid;
+
+	if (!task)
+		return false;
+
+	if (!uffd_move_comm_has_token(task->group_leader->comm,
+			      UFFD_MOVE_TARGET_TOKEN))
+		return false;
+
+	target_tgid = atomic_read(&uffd_move_target_tgid);
+	if (target_tgid != task->tgid)
+		atomic_set(&uffd_move_target_tgid, task->tgid);
+
+	return task->tgid == atomic_read(&uffd_move_target_tgid);
+}
+
+#define UFFD_MOVE_FAIL_LOG(_fmt, ...)\
+	do {\
+		pr_err_ratelimited(_fmt, ##__VA_ARGS__);\
+	} while (0)
+
+#define UFFD_MOVE_CRITICAL_LOG(_fmt, ...)\
+	do {\
+		if (uffd_move_is_target_task(current))\
+			pr_err(_fmt, ##__VA_ARGS__);\
+		else\
+			pr_err_ratelimited(_fmt, ##__VA_ARGS__);\
+	} while (0)
+#else
+#define UFFD_MOVE_FAIL_LOG(_fmt, ...)\
+	do {\
+	} while (0)
+#define UFFD_MOVE_CRITICAL_LOG(_fmt, ...)\
+	do {\
+	} while (0)
+#endif
+
 static int validate_move_areas(struct userfaultfd_ctx *ctx,
 			       struct vm_area_struct *src_vma,
 			       struct vm_area_struct *dst_vma)
 {
 	if ((src_vma->vm_flags & VM_ACCESS_FLAGS) !=
-	    (dst_vma->vm_flags & VM_ACCESS_FLAGS))
+	    (dst_vma->vm_flags & VM_ACCESS_FLAGS)) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: validate_move_areas fail access_flags src_access=%#lx dst_access=%#lx src_vm_flags=%#lx dst_vm_flags=%#lx"
+				   UFFD_MOVE_VALIDATE_META_FMT "\n",
+				   src_vma->vm_flags & VM_ACCESS_FLAGS,
+				   dst_vma->vm_flags & VM_ACCESS_FLAGS,
+				   src_vma->vm_flags, dst_vma->vm_flags,
+				   src_vma, dst_vma,
+				   src_vma->vm_start, src_vma->vm_end,
+				   dst_vma->vm_start, dst_vma->vm_end,
+				   src_vma->anon_vma, dst_vma->anon_vma,
+				   ctx, dst_vma->vm_userfaultfd_ctx.ctx);
 		return -EINVAL;
+	}
 
-	if (pgprot_val(src_vma->vm_page_prot) != pgprot_val(dst_vma->vm_page_prot))
+	if (pgprot_val(src_vma->vm_page_prot) != pgprot_val(dst_vma->vm_page_prot)) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: validate_move_areas fail pgprot src_pgprot=%#lx dst_pgprot=%#lx"
+				   UFFD_MOVE_VALIDATE_META_FMT "\n",
+				   pgprot_val(src_vma->vm_page_prot),
+				   pgprot_val(dst_vma->vm_page_prot),
+				   src_vma, dst_vma,
+				   src_vma->vm_start, src_vma->vm_end,
+				   dst_vma->vm_start, dst_vma->vm_end,
+				   src_vma->anon_vma, dst_vma->anon_vma,
+				   ctx, dst_vma->vm_userfaultfd_ctx.ctx);
 		return -EINVAL;
+	}
 
-	if ((src_vma->vm_flags & VM_LOCKED) != (dst_vma->vm_flags & VM_LOCKED))
+	if ((src_vma->vm_flags & VM_LOCKED) != (dst_vma->vm_flags & VM_LOCKED)) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: validate_move_areas fail locked src_locked=%d dst_locked=%d src_vm_flags=%#lx dst_vm_flags=%#lx"
+				   UFFD_MOVE_VALIDATE_META_FMT "\n",
+				   !!(src_vma->vm_flags & VM_LOCKED),
+				   !!(dst_vma->vm_flags & VM_LOCKED),
+				   src_vma->vm_flags, dst_vma->vm_flags,
+				   src_vma, dst_vma,
+				   src_vma->vm_start, src_vma->vm_end,
+				   dst_vma->vm_start, dst_vma->vm_end,
+				   src_vma->anon_vma, dst_vma->anon_vma,
+				   ctx, dst_vma->vm_userfaultfd_ctx.ctx);
 		return -EINVAL;
+	}
 
-	if (!(src_vma->vm_flags & VM_WRITE))
+	if (!(src_vma->vm_flags & VM_WRITE)) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: validate_move_areas fail src_not_writable src_write=%d src_vm_flags=%#lx dst_vm_flags=%#lx"
+				   UFFD_MOVE_VALIDATE_META_FMT "\n",
+				   !!(src_vma->vm_flags & VM_WRITE),
+				   src_vma->vm_flags, dst_vma->vm_flags,
+				   src_vma, dst_vma,
+				   src_vma->vm_start, src_vma->vm_end,
+				   dst_vma->vm_start, dst_vma->vm_end,
+				   src_vma->anon_vma, dst_vma->anon_vma,
+				   ctx, dst_vma->vm_userfaultfd_ctx.ctx);
 		return -EINVAL;
+	}
 
-	if (!vma_move_compatible(src_vma) || !vma_move_compatible(dst_vma))
+	if (!vma_move_compatible(src_vma) || !vma_move_compatible(dst_vma)) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: validate_move_areas fail move_compat src_compat=%d dst_compat=%d src_vm_flags=%#lx dst_vm_flags=%#lx"
+				   UFFD_MOVE_VALIDATE_META_FMT "\n",
+				   vma_move_compatible(src_vma),
+				   vma_move_compatible(dst_vma),
+				   src_vma->vm_flags, dst_vma->vm_flags,
+				   src_vma, dst_vma,
+				   src_vma->vm_start, src_vma->vm_end,
+				   dst_vma->vm_start, dst_vma->vm_end,
+				   src_vma->anon_vma, dst_vma->anon_vma,
+				   ctx, dst_vma->vm_userfaultfd_ctx.ctx);
 		return -EINVAL;
+	}
 
 	if (!dst_vma->vm_userfaultfd_ctx.ctx ||
-	    dst_vma->vm_userfaultfd_ctx.ctx != ctx)
+	    dst_vma->vm_userfaultfd_ctx.ctx != ctx) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: validate_move_areas fail dst_ctx dst_ctx=%px expected_ctx=%px src_vm_flags=%#lx dst_vm_flags=%#lx"
+				   UFFD_MOVE_VALIDATE_META_FMT "\n",
+				   dst_vma->vm_userfaultfd_ctx.ctx, ctx,
+				   src_vma->vm_flags, dst_vma->vm_flags,
+				   src_vma, dst_vma,
+				   src_vma->vm_start, src_vma->vm_end,
+				   dst_vma->vm_start, dst_vma->vm_end,
+				   src_vma->anon_vma, dst_vma->anon_vma,
+				   ctx, dst_vma->vm_userfaultfd_ctx.ctx);
 		return -EINVAL;
+	}
 
-	if (!vma_is_anonymous(src_vma) || !vma_is_anonymous(dst_vma))
+	if (!vma_is_anonymous(src_vma) || !vma_is_anonymous(dst_vma)) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: validate_move_areas fail anon src_anon=%d dst_anon=%d src_vm_flags=%#lx dst_vm_flags=%#lx"
+				   UFFD_MOVE_VALIDATE_META_FMT "\n",
+				   vma_is_anonymous(src_vma),
+				   vma_is_anonymous(dst_vma),
+				   src_vma->vm_flags, dst_vma->vm_flags,
+				   src_vma, dst_vma,
+				   src_vma->vm_start, src_vma->vm_end,
+				   dst_vma->vm_start, dst_vma->vm_end,
+				   src_vma->anon_vma, dst_vma->anon_vma,
+				   ctx, dst_vma->vm_userfaultfd_ctx.ctx);
 		return -EINVAL;
+	}
 
 	return 0;
 }
+
 
 ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		   unsigned long dst_start, unsigned long src_start,
@@ -832,7 +1043,27 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 {
 	struct vm_area_struct *dst_vma, *src_vma;
 	unsigned long dst_addr, src_addr;
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+	unsigned long first_fail_dst = dst_start, first_fail_src = src_start;
+	const char *first_fail_reason = NULL;
+#endif
 	ssize_t moved = 0, err = -EINVAL;
+	ssize_t ret;
+
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+#define UFFD_MOVE_RECORD_FAIL(_reason, _dst, _src)\
+	do {\
+		if (!first_fail_reason) {\
+			first_fail_reason = (_reason);\
+			first_fail_dst = (_dst);\
+			first_fail_src = (_src);\
+		}\
+	} while (0)
+#else
+#define UFFD_MOVE_RECORD_FAIL(_reason, _dst, _src)\
+	do {\
+	} while (0)
+#endif
 
 	BUG_ON(dst_start & ~PAGE_MASK);
 	BUG_ON(src_start & ~PAGE_MASK);
@@ -843,50 +1074,86 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 	mmap_read_lock(mm);
 
 	err = -EAGAIN;
-	if (mmap_changing && READ_ONCE(*mmap_changing))
+	if (mmap_changing && READ_ONCE(*mmap_changing)) {
+		UFFD_MOVE_RECORD_FAIL("mmap_changing", dst_start, src_start);
+		UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail mmap_changing dst=%#lx src=%#lx ret=%zd"
+				  UFFD_MOVE_FAIL_CTX_FMT "\n",
+				  dst_start, src_start, err,
+				  mm, current->pid, current->tgid, dst_start, src_start, len);
 		goto out_unlock;
+	}
 
 	err = -ENOENT;
 	dst_vma = find_vma(mm, dst_start);
 	src_vma = find_vma(mm, src_start);
-	if (!dst_vma || !src_vma)
+	if (!dst_vma || !src_vma) {
+		UFFD_MOVE_RECORD_FAIL("find_vma", dst_start, src_start);
+		UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail find_vma mm=%px dst_vma=%px src_vma=%px dst=%#lx src=%#lx len=%#lx ret=%zd\n",
+			 mm, dst_vma, src_vma, dst_start, src_start, len, err);
 		goto out_unlock;
+	}
 
 	if (dst_start < dst_vma->vm_start || dst_start + len > dst_vma->vm_end ||
-	    src_start < src_vma->vm_start || src_start + len > src_vma->vm_end)
+	    src_start < src_vma->vm_start || src_start + len > src_vma->vm_end) {
+		UFFD_MOVE_RECORD_FAIL("range_out_of_vma", dst_start, src_start);
+		UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail range dst=[%#lx-%#lx) dst_vma=[%#lx-%#lx) src=[%#lx-%#lx) src_vma=[%#lx-%#lx) ret=%zd\n",
+			 dst_start, dst_start + len, dst_vma->vm_start, dst_vma->vm_end,
+			 src_start, src_start + len, src_vma->vm_start, src_vma->vm_end, err);
 		goto out_unlock;
+	}
 
 	err = validate_move_areas(ctx, src_vma, dst_vma);
-	if (err)
+	if (err) {
+		UFFD_MOVE_RECORD_FAIL("validate_move_areas", dst_start, src_start);
+		UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail validate_move_areas dst=%#lx src=%#lx ret=%zd"
+				  UFFD_MOVE_FAIL_CTX_FMT "\n",
+				  dst_start, src_start, err,
+				  mm, current->pid, current->tgid, dst_start, src_start, len);
 		goto out_unlock;
+	}
 
 	err = 0;
 	for (dst_addr = dst_start, src_addr = src_start;
 	     src_addr < src_start + len;
 	     dst_addr += PAGE_SIZE, src_addr += PAGE_SIZE) {
 		pmd_t *dst_pmd, *src_pmd;
-		pte_t *dst_pte = NULL, *src_pte = NULL;
+		pte_t *dst_pte, *src_pte;
 		spinlock_t *dst_ptl, *src_ptl;
 		pte_t orig_dst_pte, orig_src_pte, moved_pte;
 		struct page *page;
-		bool copied = false;
+		bool copied;
+		dst_pte = NULL;
+		src_pte = NULL;
+		copied = false;
 
 		if (fatal_signal_pending(current)) {
 			err = -EINTR;
+			UFFD_MOVE_RECORD_FAIL("fatal_signal_pending", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail fatal_signal dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			break;
 		}
 
 		dst_pmd = mm_alloc_pmd(mm, dst_addr);
 		if (unlikely(!dst_pmd)) {
 			err = -ENOMEM;
+			UFFD_MOVE_RECORD_FAIL("dst_pmd_alloc", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail dst_pmd_alloc dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			break;
 		}
 		if (unlikely(pmd_none(*dst_pmd)) && unlikely(__pte_alloc(mm, dst_pmd))) {
 			err = -ENOMEM;
+			UFFD_MOVE_RECORD_FAIL("dst_pte_alloc", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail dst_pte_alloc dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			break;
 		}
 		if (unlikely(pmd_trans_huge(*dst_pmd))) {
 			err = -EEXIST;
+			UFFD_MOVE_RECORD_FAIL("dst_pmd_trans_huge", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail dst_pmd_trans_huge dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			break;
 		}
 
@@ -897,10 +1164,16 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 				continue;
 			}
 			err = -ENOENT;
+			UFFD_MOVE_RECORD_FAIL("src_pmd_missing", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail src_pmd_missing dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			break;
 		}
 		if (unlikely(pmd_trans_huge(*src_pmd))) {
 			err = -EBUSY;
+			UFFD_MOVE_RECORD_FAIL("src_pmd_trans_huge", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail src_pmd_trans_huge dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			break;
 		}
 
@@ -908,6 +1181,9 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		src_pte = pte_offset_map(src_pmd, src_addr);
 		if (!dst_pte || !src_pte) {
 			err = -EFAULT;
+			UFFD_MOVE_RECORD_FAIL("pte_offset_map", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail pte_offset_map dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			goto out_unmap;
 		}
 
@@ -919,7 +1195,35 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		orig_src_pte = *src_pte;
 
 		if (!pte_none(orig_dst_pte)) {
+			bool dst_present = pte_present(orig_dst_pte);
+			bool src_present = pte_present(orig_src_pte);
+			unsigned long dst_pfn = dst_present ? (unsigned long)pte_pfn(orig_dst_pte) : 0UL;
+			unsigned long src_pfn = src_present ? (unsigned long)pte_pfn(orig_src_pte) : 0UL;
+			const char *fail_reason = "dst_pte_not_none";
+
 			err = -EEXIST;
+			if (dst_present && src_present) {
+				if (dst_pfn != src_pfn) {
+					err = -EBUSY;
+					fail_reason = "dst_pte_conflict_present";
+				} else {
+					fail_reason = "dst_pte_same_present";
+				}
+			}
+
+			UFFD_MOVE_RECORD_FAIL(fail_reason, dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail dst_pte_not_none dst=%#lx src=%#lx ret=%zd"
+					  " reason=%s"
+					  " dst_pte_val=%#llx src_pte_val=%#llx"
+					  " dst_present=%d src_present=%d dst_pfn=%#lx src_pfn=%#lx"
+					  UFFD_MOVE_FAIL_CTX_FMT "\n",
+					  dst_addr, src_addr, err,
+					  fail_reason,
+					  (unsigned long long)pte_val(orig_dst_pte),
+					  (unsigned long long)pte_val(orig_src_pte),
+					  dst_present, src_present,
+					  dst_pfn, src_pfn,
+					  mm, current->pid, current->tgid, dst_start, src_start, len);
 			goto out_unlock_pt;
 		}
 		if (pte_none(orig_src_pte)) {
@@ -928,10 +1232,16 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 				goto out_unlock_pt;
 			}
 			err = -ENOENT;
+			UFFD_MOVE_RECORD_FAIL("src_pte_none", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail src_pte_none dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			goto out_unlock_pt;
 		}
 		if (!pte_present(orig_src_pte)) {
 			err = -EBUSY;
+			UFFD_MOVE_RECORD_FAIL("src_pte_not_present", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail src_pte_not_present dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			goto out_unlock_pt;
 		}
 
@@ -940,7 +1250,7 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 
 			ptep_clear_flush(src_vma, src_addr, src_pte);
 			zero_pte = pte_mkspecial(pfn_pte(my_zero_pfn(dst_addr),
-							 dst_vma->vm_page_prot));
+						 dst_vma->vm_page_prot));
 			set_pte_at(mm, dst_addr, dst_pte, zero_pte);
 			update_mmu_cache(dst_vma, dst_addr, dst_pte);
 			copied = true;
@@ -948,18 +1258,53 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		}
 
 		page = vm_normal_page(src_vma, src_addr, orig_src_pte);
-		if (!page || !PageAnon(page) || page_mapcount(page) != 1) {
+		if (!page) {
 			err = -EBUSY;
+			UFFD_MOVE_RECORD_FAIL("vm_normal_page_null", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail vm_normal_page_null dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
+			goto out_unlock_pt;
+		}
+		if (!PageAnon(page)) {
+			err = -EBUSY;
+			UFFD_MOVE_RECORD_FAIL("page_not_anon", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail page_not_anon dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
+			goto out_unlock_pt;
+		}
+		if (page_mapcount(page) != 1) {
+			err = -EBUSY;
+			UFFD_MOVE_RECORD_FAIL("page_mapcount_not_one", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail page_mapcount_not_one dst=%#lx src=%#lx mapcount=%d page_count=%d"
+					  " anon=%d swapcache=%d ksm=%d writeback=%d ret=%zd"
+					  UFFD_MOVE_FAIL_CTX_FMT "\n",
+					  dst_addr, src_addr, page_mapcount(page), page_count(page),
+					  PageAnon(page), PageSwapCache(page), PageKsm(page),
+					  PageWriteback(page), err,
+					  mm, current->pid, current->tgid, dst_start, src_start, len);
+			goto out_unlock_pt;
+		}
+		if (page_maybe_dma_pinned(page)) {
+			err = -EBUSY;
+			UFFD_MOVE_RECORD_FAIL("page_dma_pinned", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail page_dma_pinned dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			goto out_unlock_pt;
 		}
 		if (!trylock_page(page)) {
 			err = -EAGAIN;
+			UFFD_MOVE_RECORD_FAIL("trylock_page", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail trylock_page dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			goto out_unlock_pt;
 		}
 		if (!pte_same(orig_src_pte, *src_pte) ||
 		    !pte_same(orig_dst_pte, *dst_pte)) {
 			unlock_page(page);
 			err = -EAGAIN;
+			UFFD_MOVE_RECORD_FAIL("pte_changed_race", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail pte_changed_race dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
 			goto out_unlock_pt;
 		}
 
@@ -967,6 +1312,29 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		page_move_anon_rmap(page, dst_vma);
 		page->index = linear_page_index(dst_vma, dst_addr);
 		set_pte_at(mm, dst_addr, dst_pte, moved_pte);
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+		if (unlikely(!pte_none(*src_pte) ||
+			     !pte_present(*dst_pte) ||
+			     pte_pfn(*dst_pte) != pte_pfn(moved_pte))) {
+			bool src_none = pte_none(*src_pte);
+			bool dst_present = pte_present(*dst_pte);
+			unsigned long dst_pfn = dst_present ? (unsigned long)pte_pfn(*dst_pte) : 0UL;
+			unsigned long moved_pfn = (unsigned long)pte_pfn(moved_pte);
+
+			UFFD_MOVE_CRITICAL_LOG("uffd_move: invariant_violation post_set_pte dst=%#lx src=%#lx"
+					  " src_none=%d dst_present=%d pfn_match=%d"
+					  " src_pte_val=%#llx dst_pte_val=%#llx moved_pte_val=%#llx"
+					  " dst_pfn=%#lx moved_pfn=%#lx"
+					  UFFD_MOVE_FAIL_CTX_FMT "\n",
+					  dst_addr, src_addr,
+					  src_none, dst_present, dst_present && (dst_pfn == moved_pfn),
+					  (unsigned long long)pte_val(*src_pte),
+					  (unsigned long long)pte_val(*dst_pte),
+					  (unsigned long long)pte_val(moved_pte),
+					  dst_pfn, moved_pfn,
+					  mm, current->pid, current->tgid, dst_start, src_start, len);
+		}
+#endif
 		update_mmu_cache(dst_vma, dst_addr, dst_pte);
 		unlock_page(page);
 		copied = true;
@@ -984,8 +1352,12 @@ out_unmap:
 			continue;
 		}
 
-		if (!err)
+		if (!err) {
 			err = -EFAULT;
+			UFFD_MOVE_RECORD_FAIL("unexpected_no_error", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail unexpected_no_error dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
+		}
 		break;
 	}
 
@@ -993,8 +1365,44 @@ out_unmap:
 		flush_tlb_range(src_vma, src_start, src_start + moved);
 
 out_unlock:
+	ret = moved ? moved : err;
+#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
+	{
+		s64 summary_calls = atomic64_inc_return(&uffd_move_summary_calls);
+		s64 moved_pages = moved >> PAGE_SHIFT;
+
+		if (moved_pages > 0)
+			atomic64_add(moved_pages, &uffd_move_summary_success_pages);
+		if (moved > 0 && first_fail_reason)
+			atomic64_inc(&uffd_move_summary_partial_calls);
+		else if (ret < 0)
+			atomic64_inc(&uffd_move_summary_fail_calls);
+
+		if (!(summary_calls & (UFFD_MOVE_SUMMARY_EVERY - 1))) {
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages summary mm=%px pid=%d tgid=%d calls=%lld success_pages=%lld partial_pages=%lld fail_calls=%lld first_fail=%s last_moved=%zd last_ret=%zd\n",
+				    mm, current->pid, current->tgid,
+				    (long long)summary_calls,
+				    (long long)atomic64_read(&uffd_move_summary_success_pages),
+				    (long long)atomic64_read(&uffd_move_summary_partial_calls),
+				    (long long)atomic64_read(&uffd_move_summary_fail_calls),
+				    first_fail_reason ? first_fail_reason : "none",
+				    moved, ret);
+		}
+	}
+	if (first_fail_reason) {
+		UFFD_MOVE_FAIL_LOG("uffd_move: move_pages exit mm=%px dst_start=%#lx src_start=%#lx len=%#lx moved=%zd ret=%zd"
+				  " first_fail=%s fail_dst=%#lx fail_src=%#lx pid=%d tgid=%d\n",
+				  mm, dst_start, src_start, len, moved, ret,
+				  first_fail_reason, first_fail_dst, first_fail_src,
+				  current->pid, current->tgid);
+	} else {
+		UFFD_MOVE_FAIL_LOG("uffd_move: move_pages exit mm=%px dst_start=%#lx src_start=%#lx len=%#lx moved=%zd ret=%zd\n",
+				 mm, dst_start, src_start, len, moved, ret);
+	}
+#endif
 	mmap_read_unlock(mm);
-	return moved ? moved : err;
+#undef UFFD_MOVE_RECORD_FAIL
+	return ret;
 }
 
 int mwriteprotect_range(struct mm_struct *dst_mm, unsigned long start,

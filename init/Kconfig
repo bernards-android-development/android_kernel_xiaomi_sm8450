@@ -1857,6 +1857,13 @@ config USERFAULTFD
 	  Enable the userfaultfd() system call that allows to intercept and
 	  handle page faults in userland.
 
+config USERFAULTFD_DEBUG_LOG
+	bool "Enable userfaultfd debug logs"
+	depends on USERFAULTFD
+	default n
+	help
+	  Enable additional userfaultfd debug logs for MOVE/COPY diagnostics.
+
 config ARCH_HAS_MEMBARRIER_CALLBACKS
 	bool
 
