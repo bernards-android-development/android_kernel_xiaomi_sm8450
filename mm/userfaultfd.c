@@ -971,20 +971,6 @@ static int move_swap_pte(struct mm_struct *mm,
 		return -EBUSY;
 	}
 
-	if (swp_swapcount(entry) != 1) {
-		if (fail_reason)
-			*fail_reason = "swap_entry_not_exclusive";
-		return -EBUSY;
-	}
-
-	page = lookup_swap_cache(entry, src_vma, src_addr);
-	if (page) {
-		put_page(page);
-		if (fail_reason)
-			*fail_reason = "swapcache_page_present";
-		return -EBUSY;
-	}
-
 	si = get_swap_device(entry);
 	if (!si) {
 		if (fail_reason)
@@ -993,10 +979,29 @@ static int move_swap_pte(struct mm_struct *mm,
 	}
 	offset = swp_offset(entry);
 	if (READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE) {
-		put_swap_device(si);
 		if (fail_reason)
 			*fail_reason = "swapcache_race_has_cache";
-		return -EBUSY;
+		goto out_put_swap;
+	}
+
+	if (swp_swapcount(entry) != 1) {
+		if (fail_reason)
+			*fail_reason = "swap_entry_not_exclusive";
+		goto out_put_swap;
+	}
+
+	page = lookup_swap_cache(entry, src_vma, src_addr);
+	if (page) {
+		put_page(page);
+		if (fail_reason)
+			*fail_reason = "swapcache_page_present";
+		goto out_put_swap;
+	}
+
+	if (READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE) {
+		if (fail_reason)
+			*fail_reason = "swapcache_race_has_cache";
+		goto out_put_swap;
 	}
 
 	dst_pte = pte_offset_map(dst_pmd, dst_addr);
@@ -1034,6 +1039,7 @@ out_unmap:
 		pte_unmap(src_pte);
 	if (dst_pte)
 		pte_unmap(dst_pte);
+out_put_swap:
 	put_swap_device(si);
 	return ret;
 }
@@ -1178,6 +1184,8 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 #endif
 	ssize_t moved = 0, err = -EINVAL;
 	ssize_t ret;
+	unsigned long tlb_flush_start = 0, tlb_flush_end = 0;
+	bool need_tlb_flush = false;
 
 #ifdef CONFIG_USERFAULTFD_DEBUG_LOG
 #define UFFD_MOVE_RECORD_FAIL(_reason, _dst, _src)\
@@ -1276,13 +1284,6 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 					     dst_addr, src_addr, err);
 			break;
 		}
-		if (unlikely(pmd_none(*dst_pmd)) && unlikely(__pte_alloc(mm, dst_pmd))) {
-			err = -ENOMEM;
-			UFFD_MOVE_RECORD_FAIL("dst_pte_alloc", dst_addr, src_addr);
-			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail dst_pte_alloc dst=%#lx src=%#lx ret=%zd\n",
-					     dst_addr, src_addr, err);
-			break;
-		}
 		if (unlikely(pmd_trans_huge(*dst_pmd))) {
 			err = -EEXIST;
 			UFFD_MOVE_RECORD_FAIL("dst_pmd_trans_huge", dst_addr, src_addr);
@@ -1310,10 +1311,17 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 					     dst_addr, src_addr, err);
 			break;
 		}
+		if (unlikely(pmd_none(*dst_pmd)) && unlikely(__pte_alloc(mm, dst_pmd))) {
+			err = -ENOMEM;
+			UFFD_MOVE_RECORD_FAIL("dst_pte_alloc", dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail dst_pte_alloc dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
+			break;
+		}
 
 		dst_pte = pte_offset_map(dst_pmd, dst_addr);
 		src_pte = pte_offset_map(src_pmd, src_addr);
-		if (!dst_pte || !src_pte) {
+		if (unlikely(!dst_pte || !src_pte)) {
 			err = -EFAULT;
 			UFFD_MOVE_RECORD_FAIL("pte_offset_map", dst_addr, src_addr);
 			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail pte_offset_map dst=%#lx src=%#lx ret=%zd\n",
@@ -1470,6 +1478,11 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 #endif
 		update_mmu_cache(dst_vma, dst_addr, dst_pte);
 		unlock_page(page);
+		if (!need_tlb_flush) {
+			need_tlb_flush = true;
+			tlb_flush_start = src_addr;
+		}
+		tlb_flush_end = src_addr + PAGE_SIZE;
 		copied = true;
 
 out_unlock_pt:
@@ -1509,7 +1522,7 @@ out_unmap:
 			continue;
 		}
 
-		if (!err) {
+		if (unlikely(!err)) {
 			err = -EFAULT;
 			UFFD_MOVE_RECORD_FAIL("unexpected_no_error", dst_addr, src_addr);
 			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail unexpected_no_error dst=%#lx src=%#lx ret=%zd\n",
@@ -1518,8 +1531,8 @@ out_unmap:
 		break;
 	}
 
-	if (moved)
-		flush_tlb_range(src_vma, src_start, src_start + moved);
+	if (need_tlb_flush)
+		flush_tlb_range(src_vma, tlb_flush_start, tlb_flush_end);
 
 out_unlock:
 	ret = moved ? moved : err;
