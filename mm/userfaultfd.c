@@ -1028,8 +1028,16 @@ static int move_swap_pte(struct mm_struct *mm,
 			*fail_reason = "swap_dst_pte_not_none";
 		goto out_unlock;
 	}
+	if (unlikely(READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE)) {
+		if (fail_reason)
+			*fail_reason = "swapcache_race_has_cache";
+		goto out_unlock;
+	}
 
 	moved_pte = ptep_get_and_clear(mm, src_addr, src_pte);
+#ifdef CONFIG_MEM_SOFT_DIRTY
+	moved_pte = pte_swp_mksoft_dirty(moved_pte);
+#endif
 	set_pte_at(mm, dst_addr, dst_pte, moved_pte);
 	ret = 0;
 
@@ -1497,6 +1505,20 @@ retry_same_page:
 		}
 
 		moved_pte = ptep_get_and_clear(mm, src_addr, src_pte);
+		if (unlikely(page_maybe_dma_pinned(page))) {
+			set_pte_at(mm, src_addr, src_pte, moved_pte);
+			unlock_page(page);
+			if (locked_retry_page) {
+				put_page(locked_retry_page);
+				locked_retry_page = NULL;
+			}
+			err = -EBUSY;
+			UFFD_MOVE_RECORD_FAIL("page_dma_pinned_after_clear",
+					      dst_addr, src_addr);
+			UFFD_MOVE_FAIL_LOG("uffd_move: move_pages fail page_dma_pinned_after_clear dst=%#lx src=%#lx ret=%zd\n",
+					     dst_addr, src_addr, err);
+			goto out_unlock_pt;
+		}
 		page_move_anon_rmap(page, dst_vma);
 		page->index = linear_page_index(dst_vma, dst_addr);
 		set_pte_at(mm, dst_addr, dst_pte, moved_pte);
