@@ -1932,7 +1932,7 @@ static int of_qcom_slim_ngd_register(struct device *parent,
 		ngd->pdev->dev.parent = parent;
 
 		ret = driver_set_override(&ngd->pdev->dev,
-					  &ngd->pdev->driver_override,
+					  (const char**)&ngd->pdev->driver_override,
 					  QCOM_SLIM_NGD_DRV_NAME,
 					  strlen(QCOM_SLIM_NGD_DRV_NAME));
 		if (ret) {
