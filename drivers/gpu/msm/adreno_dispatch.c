@@ -1915,15 +1915,6 @@ static void do_header_and_snapshot(struct kgsl_device *device, int fault,
 	/* Always dump the snapshot on a non-drawobj failure */
 	if (cmdobj == NULL) {
 		adreno_fault_header(device, rb, NULL, fault);
-<<<<<<< HEAD
-
-		/* GMU snapshot will also pull a full device snapshot */
-		if (fault & ADRENO_GMU_FAULT)
-			gmu_core_fault_snapshot(device);
-		else
-			kgsl_device_snapshot(device, NULL, NULL, false);
-=======
->>>>>>> c7ecd7c35ae2 (msm: kgsl: disable snapshot, coresight and trace)
 		return;
 	}
 
@@ -2194,10 +2185,6 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 
 	if (test_bit(CMDOBJ_PROFILE, &cmdobj->priv))
 		cmdobj_profile_ticks(adreno_dev, cmdobj, &start, &end, &active);
-
-	info.sop = start;
-	info.eop = end;
-	info.active = active;
 
 	/* protected GPU work must not be reported */
 	if  (!(context->flags & KGSL_CONTEXT_SECURE))
