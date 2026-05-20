@@ -2201,15 +2201,6 @@ static void retire_cmdobj(struct adreno_device *adreno_dev,
 		atomic_inc(&context->proc_priv->period->frames);
 	}
 
-	log_kgsl_cmdbatch_retired_event(context->id, drawobj->timestamp,
-		context->priority, drawobj->flags, start, end);
-
-	drawctxt->submit_retire_ticks[drawctxt->ticks_index] =
-		end - cmdobj->submit_ticks;
-
-	drawctxt->ticks_index = (drawctxt->ticks_index + 1) %
-		SUBMIT_RETIRE_TICKS_SIZE;
-
 	kgsl_drawobj_destroy(drawobj);
 }
 
