@@ -1078,19 +1078,8 @@ retry_same_page:
 	}
 
 	page = vm_normal_page(src_vma, src_addr, orig_src_pte);
-	if (!page) {
-		err = -EBUSY;
-		goto out_unlock_pt;
-	}
-	if (!PageAnon(page)) {
-		err = -EBUSY;
-		goto out_unlock_pt;
-	}
-	if (page_mapcount(page) != 1) {
-		err = -EBUSY;
-		goto out_unlock_pt;
-	}
-	if (page_maybe_dma_pinned(page)) {
+	if (!page || !PageAnon(page) || PageCompound(page) ||
+	    page_mapcount(page) != 1 || page_maybe_dma_pinned(page)) {
 		err = -EBUSY;
 		goto out_unlock_pt;
 	}
@@ -1271,13 +1260,26 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		}
 
 		src_pmd = mm_find_pmd(mm, src_addr);
-		if (!src_pmd || pmd_none(*src_pmd)) {
-			if (mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES) {
-				moved += PAGE_SIZE;
-				continue;
+		if (unlikely(!src_pmd)) {
+			if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES)) {
+				err = -ENOENT;
+				break;
 			}
-			err = -ENOENT;
-			break;
+			src_pmd = mm_alloc_pmd(mm, src_addr);
+			if (unlikely(!src_pmd)) {
+				err = -ENOMEM;
+				break;
+			}
+		}
+		if (pmd_none(*src_pmd)) {
+			if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES)) {
+				err = -ENOENT;
+				break;
+			}
+			if (unlikely(__pte_alloc(mm, src_pmd))) {
+				err = -ENOMEM;
+				break;
+			}
 		}
 		if (unlikely(pmd_trans_huge(*src_pmd))) {
 			err = -EBUSY;
