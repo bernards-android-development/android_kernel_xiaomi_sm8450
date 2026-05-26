@@ -288,6 +288,25 @@ static pmd_t *mm_alloc_pmd(struct mm_struct *mm, unsigned long address)
 	return pmd_alloc(mm, pud, address);
 }
 
+static pmd_t *mm_lookup_pmd(struct mm_struct *mm, unsigned long address)
+{
+	pgd_t *pgd;
+	p4d_t *p4d;
+	pud_t *pud;
+
+	pgd = pgd_offset(mm, address);
+	if (!pgd_present(*pgd))
+		return NULL;
+	p4d = p4d_offset(pgd, address);
+	if (!p4d_present(*p4d))
+		return NULL;
+	pud = pud_offset(p4d, address);
+	if (!pud_present(*pud))
+		return NULL;
+
+	return pmd_offset(pud, address);
+}
+
 #ifdef CONFIG_HUGETLB_PAGE
 /*
  * __mcopy_atomic processing for HUGETLB vmas.  Note that this routine is
@@ -1243,6 +1262,7 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 	     src_addr < src_start + len;
 	     dst_addr += PAGE_SIZE, src_addr += PAGE_SIZE) {
 		pmd_t *dst_pmd, *src_pmd;
+		pmd_t dst_pmdval, src_pmdval;
 
 		if (fatal_signal_pending(current)) {
 			err = -EINTR;
@@ -1254,12 +1274,16 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 			err = -ENOMEM;
 			break;
 		}
-		if (unlikely(pmd_trans_huge(*dst_pmd))) {
+
+		dst_pmdval = pmd_read_atomic(dst_pmd);
+		if (unlikely(pmd_trans_huge(dst_pmdval) ||
+			     (!pmd_none(dst_pmdval) &&
+			      !pmd_present(dst_pmdval)))) {
 			err = -EEXIST;
 			break;
 		}
 
-		src_pmd = mm_find_pmd(mm, src_addr);
+		src_pmd = mm_lookup_pmd(mm, src_addr);
 		if (unlikely(!src_pmd)) {
 			if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES)) {
 				err = -ENOENT;
@@ -1271,7 +1295,8 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 				break;
 			}
 		}
-		if (pmd_none(*src_pmd)) {
+		src_pmdval = pmd_read_atomic(src_pmd);
+		if (pmd_none(src_pmdval)) {
 			if (!(mode & UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES)) {
 				err = -ENOENT;
 				break;
@@ -1280,13 +1305,31 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 				err = -ENOMEM;
 				break;
 			}
+			src_pmdval = pmd_read_atomic(src_pmd);
 		}
-		if (unlikely(pmd_trans_huge(*src_pmd))) {
+		if (unlikely(pmd_none(src_pmdval))) {
+			err = -EFAULT;
+			break;
+		}
+		if (unlikely(pmd_trans_huge(src_pmdval) ||
+			     !pmd_present(src_pmdval))) {
 			err = -EBUSY;
 			break;
 		}
-		if (unlikely(pmd_none(*dst_pmd)) && unlikely(__pte_alloc(mm, dst_pmd))) {
-			err = -ENOMEM;
+		if (unlikely(pmd_none(dst_pmdval))) {
+			if (unlikely(__pte_alloc(mm, dst_pmd))) {
+				err = -ENOMEM;
+				break;
+			}
+			dst_pmdval = pmd_read_atomic(dst_pmd);
+		}
+		if (unlikely(pmd_none(dst_pmdval))) {
+			err = -EFAULT;
+			break;
+		}
+		if (unlikely(pmd_trans_huge(dst_pmdval) ||
+			     !pmd_present(dst_pmdval))) {
+			err = -EEXIST;
 			break;
 		}
 
