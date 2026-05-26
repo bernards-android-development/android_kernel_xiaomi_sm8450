@@ -34,22 +34,8 @@
 	do {							\
 		pr_err_ratelimited(_fmt, ##__VA_ARGS__);		\
 	} while (0)
-#define UFFD_MOVE_LOG(_fmt, ...)						\
-	do {							\
-		pr_err_ratelimited(_fmt, ##__VA_ARGS__);		\
-	} while (0)
-#define UFFD_MOVE_TARGET_LOG(_fmt, ...)					\
-	do {							\
-		pr_err(_fmt, ##__VA_ARGS__);			\
-	} while (0)
 #else
 #define UFFD_COPY_LOG(_fmt, ...)						\
-	do {							\
-	} while (0)
-#define UFFD_MOVE_LOG(_fmt, ...)						\
-	do {							\
-	} while (0)
-#define UFFD_MOVE_TARGET_LOG(_fmt, ...)					\
 	do {							\
 	} while (0)
 #endif
@@ -1772,8 +1758,6 @@ out:
 	return ret;
 }
 
-static bool uffd_move_is_target_task(struct task_struct *task);
-
 static int userfaultfd_copy(struct userfaultfd_ctx *ctx,
 			    unsigned long arg)
 {
@@ -1784,8 +1768,6 @@ static int userfaultfd_copy(struct userfaultfd_ctx *ctx,
 #ifdef CONFIG_USERFAULTFD_DEBUG_LOG
 	__s64 copied_or_err = -1;
 	int src_range_ret;
-	bool copy_req_valid = false;
-	bool target_task = uffd_move_is_target_task(current);
 #endif
 
 	user_uffdio_copy = (struct uffdio_copy __user *) arg;
@@ -1812,9 +1794,6 @@ static int userfaultfd_copy(struct userfaultfd_ctx *ctx,
 			      current->tgid, current->pid, ret);
 		goto out;
 	}
-#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
-	copy_req_valid = true;
-#endif
 	UFFD_COPY_LOG("uffd_copy: ioctl request pid=%d tid=%d mm=%px dst=%#llx src=%#llx len=%#llx mode=%#llx\n",
 		      current->tgid, current->pid, ctx->mm,
 		      (unsigned long long)uffdio_copy.dst,
@@ -1899,30 +1878,6 @@ static int userfaultfd_copy(struct userfaultfd_ctx *ctx,
 #endif
 out:
 	if (ret < 0) {
-#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
-		if (copy_req_valid && target_task) {
-			struct mm_struct *mm = ctx ? ctx->mm : NULL;
-			unsigned long map_count_walked = 0;
-			unsigned long map_count_field = 0;
-			struct vm_area_struct *vma;
-
-			if (mm) {
-				mmap_read_lock(mm);
-				for (vma = mm->mmap; vma; vma = vma->vm_next)
-					map_count_walked++;
-				map_count_field = READ_ONCE(mm->map_count);
-				mmap_read_unlock(mm);
-			}
-
-			UFFD_MOVE_TARGET_LOG("uffd_copy: ioctl fail target_summary ret=%lld pid=%d tid=%d mm=%px dst=%#llx src=%#llx len=%#llx mode=%#llx map_count_field=%lu map_count_walked=%lu copy_or_err=%lld\n",
-				       ret, current->tgid, current->pid, mm,
-				       (unsigned long long)uffdio_copy.dst,
-				       (unsigned long long)uffdio_copy.src,
-				       (unsigned long long)uffdio_copy.len,
-				       (unsigned long long)uffdio_copy.mode,
-				       map_count_field, map_count_walked, copied_or_err);
-		}
-#endif
 #ifdef CONFIG_USERFAULTFD_DEBUG_LOG
 		UFFD_COPY_LOG("uffd_copy: ioctl exit error pid=%d tid=%d ret=%lld copy_or_err=%lld\n",
 			      current->tgid, current->pid, ret, copied_or_err);
@@ -2112,186 +2067,57 @@ static inline unsigned int uffd_ctx_features(__u64 user_features)
 	return (unsigned int)user_features | UFFD_FEATURE_INITIALIZED;
 }
 
-#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
-#define UFFD_MOVE_TARGET_TOKEN "coolapk"
-static atomic_t uffd_move_target_tgid = ATOMIC_INIT(-1);
-
-static bool uffd_move_comm_has_token(const char *comm, const char *token)
-{
-	size_t i, j;
-
-	if (!comm || !token || !token[0])
-		return false;
-
-	for (i = 0; i < TASK_COMM_LEN && comm[i]; i++) {
-		for (j = 0; token[j] && i + j < TASK_COMM_LEN &&
-		     comm[i + j] == token[j]; j++)
-			;
-		if (!token[j])
-			return true;
-	}
-
-	return false;
-}
-
-static bool uffd_move_is_target_task(struct task_struct *task)
-{
-	int target_tgid;
-
-	if (!task)
-		return false;
-
-	if (!uffd_move_comm_has_token(task->group_leader->comm,
-			      UFFD_MOVE_TARGET_TOKEN))
-		return false;
-
-	target_tgid = atomic_read(&uffd_move_target_tgid);
-	if (target_tgid != task->tgid)
-		atomic_set(&uffd_move_target_tgid, task->tgid);
-
-	return task->tgid == atomic_read(&uffd_move_target_tgid);
-}
-
-static void uffd_move_log_target_mm_snapshot(struct userfaultfd_ctx *ctx, __s64 ret)
-{
-	struct mm_struct *mm;
-	struct vm_area_struct *vma;
-	struct task_struct *owner;
-	unsigned long map_count_walked = 0;
-	unsigned long map_count_field;
-
-	if (ret >= 0 || !ctx || !uffd_move_is_target_task(current))
-		return;
-
-	mm = ctx->mm;
-	if (!mm)
-		return;
-
-	mmap_read_lock(mm);
-	for (vma = mm->mmap; vma; vma = vma->vm_next)
-		map_count_walked++;
-	map_count_field = READ_ONCE(mm->map_count);
-	owner = READ_ONCE(mm->owner);
-	UFFD_MOVE_TARGET_LOG("uffd_move: target_mm snapshot tgid=%d pid=%d comm=%s mm=%px map_count_field=%lu map_count_walked=%lu owner_tgid=%d owner_comm=%s ret=%lld\n",
-		      current->tgid, current->pid, current->comm, mm,
-		      map_count_field, map_count_walked,
-		      owner ? owner->tgid : -1,
-		      owner ? owner->comm : "none", ret);
-	mmap_read_unlock(mm);
-}
-#else
-static inline bool uffd_move_is_target_task(struct task_struct *task)
-{
-	return false;
-}
-
-static inline void uffd_move_log_target_mm_snapshot(struct userfaultfd_ctx *ctx,
-					      __s64 ret)
-{
-}
-#endif
-
 static int userfaultfd_move(struct userfaultfd_ctx *ctx, unsigned long arg)
 {
 	__s64 ret;
 	struct uffdio_move uffdio_move;
 	struct uffdio_move __user *user_uffdio_move;
 	struct userfaultfd_wake_range range;
-#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
-	__s64 moved_bytes = -1;
-	bool move_req_valid = false;
-#endif
 
 	user_uffdio_move = (struct uffdio_move __user *)arg;
-	UFFD_MOVE_LOG("uffd_move: ioctl enter pid=%d tid=%d mm=%px arg=%#lx\n",
-			   current->tgid, current->pid, ctx->mm, arg);
 
 	ret = -EAGAIN;
 	if (unlikely(READ_ONCE(ctx->mmap_changing))) {
-			UFFD_MOVE_LOG("uffd_move: ioctl fail mmap_changing pid=%d tid=%d ret=%lld\n",
-					   current->tgid, current->pid, ret);
-		if (unlikely(put_user(ret, &user_uffdio_move->move))) {
-				UFFD_MOVE_LOG("uffd_move: ioctl fail put_user(move) in mmap_changing ret=%d\n",
-						   -EFAULT);
+		if (unlikely(put_user(ret, &user_uffdio_move->move)))
 			return -EFAULT;
-		}
 		goto out;
 	}
 
 	ret = -EFAULT;
 	if (copy_from_user(&uffdio_move, user_uffdio_move,
-			   sizeof(uffdio_move) - sizeof(__s64))) {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail copy_from_user pid=%d tid=%d ret=%lld\n",
-				   current->tgid, current->pid, ret);
+			   sizeof(uffdio_move) - sizeof(__s64)))
 		goto out;
-	}
-#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
-	move_req_valid = true;
-#endif
-
-	UFFD_MOVE_LOG("uffd_move: ioctl request pid=%d tid=%d mm=%px dst=%#llx src=%#llx len=%#llx mode=%#llx\n",
-			   current->tgid, current->pid, ctx->mm,
-			   (unsigned long long)uffdio_move.dst,
-			   (unsigned long long)uffdio_move.src,
-			   (unsigned long long)uffdio_move.len,
-			   (unsigned long long)uffdio_move.mode);
 
 	/* Do not allow cross-mm moves. */
-	if (ctx->mm != current->mm) {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail cross-mm ctx_mm=%px current_mm=%px ret=%d\n",
-				   ctx->mm, current->mm, -EINVAL);
+	if (ctx->mm != current->mm)
 		return -EINVAL;
-	}
 
 	ret = validate_range(ctx->mm, uffdio_move.dst, uffdio_move.len);
-	if (ret) {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail dst range dst=%#llx len=%#llx ret=%lld\n",
-				   (unsigned long long)uffdio_move.dst,
-				   (unsigned long long)uffdio_move.len, ret);
+	if (ret)
 		goto out;
-	}
 	ret = validate_range(ctx->mm, uffdio_move.src, uffdio_move.len);
-	if (ret) {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail src range src=%#llx len=%#llx ret=%lld\n",
-				   (unsigned long long)uffdio_move.src,
-				   (unsigned long long)uffdio_move.len, ret);
+	if (ret)
 		goto out;
-	}
 
 	ret = -EINVAL;
 	if (uffdio_move.mode & ~(UFFDIO_MOVE_MODE_ALLOW_SRC_HOLES |
 				 UFFDIO_MOVE_MODE_DONTWAKE |
-				 UFFDIO_MOVE_MODE_CONFIRM_FIXED)) {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail invalid mode=%#llx ret=%lld\n",
-				   (unsigned long long)uffdio_move.mode, ret);
+				 UFFDIO_MOVE_MODE_CONFIRM_FIXED))
 		goto out;
-	}
 
 	if (mmget_not_zero(ctx->mm)) {
 		ret = move_pages(ctx->mm, ctx, uffdio_move.dst, uffdio_move.src,
 				 uffdio_move.len, uffdio_move.mode,
 				 &ctx->mmap_changing);
-#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
-		moved_bytes = ret;
-#endif
 		mmput(ctx->mm);
 	} else {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail mmget_not_zero mm=%px ret=%d\n",
-				   ctx->mm, -ESRCH);
 		return -ESRCH;
 	}
 
-	UFFD_MOVE_LOG("uffd_move: ioctl move_pages done pid=%d tid=%d moved_or_err=%lld\n",
-			   current->tgid, current->pid, moved_bytes);
-
-	if (unlikely(put_user(ret, &user_uffdio_move->move))) {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail put_user(move) ret=%d\n", -EFAULT);
+	if (unlikely(put_user(ret, &user_uffdio_move->move)))
 		return -EFAULT;
-	}
-	if (ret < 0) {
-		UFFD_MOVE_LOG("uffd_move: ioctl fail move_pages ret=%lld\n", ret);
+	if (ret < 0)
 		goto out;
-	}
 
 	BUG_ON(!ret);
 	range.len = ret;
@@ -2300,40 +2126,7 @@ static int userfaultfd_move(struct userfaultfd_ctx *ctx, unsigned long arg)
 		wake_userfault(ctx, &range);
 	}
 	ret = range.len == uffdio_move.len ? 0 : -EAGAIN;
-	UFFD_MOVE_LOG("uffd_move: ioctl exit pid=%d tid=%d writeback_move=%lld final_ret=%lld wake_len=%llu\n",
-			   current->tgid, current->pid, moved_bytes, ret,
-			   (unsigned long long)range.len);
 out:
-#ifdef CONFIG_USERFAULTFD_DEBUG_LOG
-	if (ret < 0) {
-		if (move_req_valid && uffd_move_is_target_task(current)) {
-			struct mm_struct *mm = ctx ? ctx->mm : NULL;
-			unsigned long map_count_walked = 0;
-			unsigned long map_count_field = 0;
-			struct vm_area_struct *vma;
-
-			if (mm) {
-				mmap_read_lock(mm);
-				for (vma = mm->mmap; vma; vma = vma->vm_next)
-					map_count_walked++;
-				map_count_field = READ_ONCE(mm->map_count);
-				mmap_read_unlock(mm);
-			}
-
-				UFFD_MOVE_TARGET_LOG("uffd_move: ioctl fail target_summary ret=%lld pid=%d tid=%d mm=%px dst=%#llx src=%#llx len=%#llx mode=%#llx map_count_field=%lu map_count_walked=%lu\n",
-				       ret, current->tgid, current->pid, mm,
-				       (unsigned long long)uffdio_move.dst,
-				       (unsigned long long)uffdio_move.src,
-				       (unsigned long long)uffdio_move.len,
-				       (unsigned long long)uffdio_move.mode,
-				       map_count_field, map_count_walked);
-		}
-
-		uffd_move_log_target_mm_snapshot(ctx, ret);
-			UFFD_MOVE_LOG("uffd_move: ioctl exit error pid=%d tid=%d ret=%lld\n",
-					   current->tgid, current->pid, ret);
-	}
-#endif
 	return ret;
 }
 
