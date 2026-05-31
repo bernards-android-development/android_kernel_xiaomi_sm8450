@@ -939,8 +939,10 @@ static int move_swap_pte(struct mm_struct *mm,
 
 	if (!pte_same(*src_pte, orig_src_pte))
 		goto out_unlock;
-	if (!pte_none(*dst_pte))
+	if (!pte_none(*dst_pte)) {
+		ret = -EEXIST;
 		goto out_unlock;
+	}
 	if (unlikely(READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE))
 		goto out_unlock;
 
