@@ -414,7 +414,6 @@ static void __qrtr_node_release(struct kref *kref)
 	struct qrtr_node *node = container_of(kref, struct qrtr_node, ref);
 	unsigned long flags;
 	void __rcu **slot;
-	unsigned long index;
 
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
 	if (node->nid != QRTR_EP_NID_AUTO) {
