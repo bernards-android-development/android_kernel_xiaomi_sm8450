@@ -216,7 +216,7 @@ struct qrtr_tx_flow {
 #define QRTR_TX_FLOW_HIGH	10
 #define QRTR_TX_FLOW_LOW	5
 
-static struct sk_buff *qrtr_alloc_ctrl_packet(struct qrtr_ctrl_pkt **pkt);
+static struct sk_buff *qrtr_alloc_ctrl_packet(struct qrtr_ctrl_pkt **pkt, gfp_t flags);
 static int qrtr_local_enqueue(struct qrtr_node *node, struct sk_buff *skb,
 			      int type, struct sockaddr_qrtr *from,
 			      struct sockaddr_qrtr *to, unsigned int flags);
@@ -414,6 +414,7 @@ static void __qrtr_node_release(struct kref *kref)
 	struct qrtr_node *node = container_of(kref, struct qrtr_node, ref);
 	unsigned long flags;
 	void __rcu **slot;
+	unsigned long index;
 
 	spin_lock_irqsave(&qrtr_nodes_lock, flags);
 	if (node->nid != QRTR_EP_NID_AUTO) {
@@ -551,7 +552,7 @@ static int qrtr_tx_wait(struct qrtr_node *node, struct sockaddr_qrtr *to,
 	timeo = sock_sndtimeo(sk, flags & MSG_DONTWAIT);
 
 	mutex_lock(&node->qrtr_tx_lock);
-	flow = radix_tree_lookup(&node->qrtr_tx_flow, key);
+	flow = xa_load(&node->qrtr_tx_flow, key);
 	if (!flow) {
 		flow = kzalloc(sizeof(*flow), GFP_KERNEL);
 		if (flow) {
@@ -1014,18 +1015,20 @@ EXPORT_SYMBOL_GPL(qrtr_endpoint_post);
 /**
  * qrtr_alloc_ctrl_packet() - allocate control packet skb
  * @pkt: reference to qrtr_ctrl_pkt pointer
+ * @flags: the type of memory to allocate
  *
  * Returns newly allocated sk_buff, or NULL on failure
  *
  * This function allocates a sk_buff large enough to carry a qrtr_ctrl_pkt and
  * on success returns a reference to the control packet in @pkt.
  */
-static struct sk_buff *qrtr_alloc_ctrl_packet(struct qrtr_ctrl_pkt **pkt)
+static struct sk_buff *qrtr_alloc_ctrl_packet(struct qrtr_ctrl_pkt **pkt,
+					      gfp_t flags)
 {
 	const int pkt_len = sizeof(struct qrtr_ctrl_pkt);
 	struct sk_buff *skb;
 
-	skb = alloc_skb(QRTR_HDR_MAX_SIZE + pkt_len, GFP_KERNEL);
+	skb = alloc_skb(QRTR_HDR_MAX_SIZE + pkt_len, flags);
 	if (!skb)
 		return NULL;
 
@@ -1183,7 +1186,7 @@ static void qrtr_hello_work(struct kthread_work *work)
 	if (!ctrl)
 		return;
 
-	skb = qrtr_alloc_ctrl_packet(&pkt);
+	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
 	if (!skb) {
 		qrtr_port_put(ctrl);
 		return;
@@ -1278,7 +1281,7 @@ static void qrtr_notify_bye(u32 nid)
 	struct qrtr_ctrl_pkt *pkt;
 	struct sk_buff *skb;
 
-	skb = qrtr_alloc_ctrl_packet(&pkt);
+	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
 	if (!skb)
 		return;
 
@@ -1325,7 +1328,7 @@ static void qrtr_fwd_del_proc(struct qrtr_node *src, unsigned int nid)
 		if (!qrtr_must_forward(src, dst, QRTR_TYPE_DEL_PROC))
 			continue;
 
-		skb = qrtr_alloc_ctrl_packet(&pkt);
+		skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
 		if (!skb)
 			return;
 
@@ -1416,7 +1419,7 @@ static void qrtr_send_del_client(struct qrtr_sock *ipc)
 	struct sk_buff *skb;
 	int type = QRTR_TYPE_DEL_CLIENT;
 
-	skb = qrtr_alloc_ctrl_packet(&pkt);
+	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
 	if (!skb)
 		return;
 
@@ -1822,7 +1825,7 @@ static int qrtr_send_resume_tx(struct qrtr_cb *cb)
 	if (!node)
 		return -EINVAL;
 
-	skb = qrtr_alloc_ctrl_packet(&pkt);
+	skb = qrtr_alloc_ctrl_packet(&pkt, GFP_KERNEL);
 	if (!skb) {
 		qrtr_log_resume_tx(cb->src_node, cb->src_port,
 				   RTX_CTRL_SKB_ALLOC_FAIL);
