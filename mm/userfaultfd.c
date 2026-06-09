@@ -1222,6 +1222,8 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 	ssize_t ret;
 	unsigned long tlb_flush_start = 0, tlb_flush_end = 0;
 	bool need_tlb_flush = false;
+	struct mmu_notifier_range range;
+	bool notifier_active = false;
 
 	BUG_ON(dst_start & ~PAGE_MASK);
 	BUG_ON(src_start & ~PAGE_MASK);
@@ -1248,6 +1250,19 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 	err = validate_move_areas(ctx, src_vma, dst_vma);
 	if (err)
 		goto out_unlock;
+
+	/*
+	 * Notify IOMMU/SVA and other secondary MMU consumers that this src
+	 * range is being cleared so they can drop cached translations before
+	 * the underlying pages are reused. Wrap the whole batch -- the
+	 * notifier must be active across every ptep_get_and_clear() inside
+	 * move_pages_pte(), and per-PTE start/end churn over long ranges
+	 * (ART CC GC moves tens of MB per ioctl) would dominate the cost.
+	 */
+	mmu_notifier_range_init(&range, MMU_NOTIFY_CLEAR, 0, src_vma, mm,
+				src_start, src_start + len);
+	mmu_notifier_invalidate_range_start(&range);
+	notifier_active = true;
 
 	err = 0;
 	dst_addr = dst_start;
@@ -1358,6 +1373,8 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		flush_tlb_range(src_vma, tlb_flush_start, tlb_flush_end);
 
 out_unlock:
+	if (notifier_active)
+		mmu_notifier_invalidate_range_end(&range);
 	ret = moved ? moved : err;
 	mmap_read_unlock(mm);
 	return ret;
