@@ -878,8 +878,6 @@ static inline bool vma_move_compatible(struct vm_area_struct *vma)
 	return !(vma->vm_flags & (VM_PFNMAP | VM_IO | VM_HUGETLB | VM_MIXEDMAP));
 }
 
-#define UFFD_MOVE_TRANSIENT_RETRIES 1
-
 #ifdef CONFIG_SWAP
 static int move_swap_pte(struct mm_struct *mm,
 			 struct vm_area_struct *dst_vma,
@@ -890,7 +888,6 @@ static int move_swap_pte(struct mm_struct *mm,
 {
 	swp_entry_t entry;
 	struct swap_info_struct *si;
-	struct page *page;
 	unsigned long offset;
 	pte_t *dst_pte = NULL, *src_pte = NULL;
 	spinlock_t *dst_ptl, *src_ptl;
@@ -911,19 +908,13 @@ static int move_swap_pte(struct mm_struct *mm,
 	if (!si)
 		return -EBUSY;
 	offset = swp_offset(entry);
-	if (READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE)
-		goto out_put_swap;
 
+	/*
+	 * Only move entries owned exclusively by this anon_vma. Shared swap
+	 * entries would require updating multiple rmap chains which we can
+	 * neither do nor protect against here.
+	 */
 	if (swp_swapcount(entry) != 1)
-		goto out_put_swap;
-
-	page = lookup_swap_cache(entry, src_vma, src_addr);
-	if (page) {
-		put_page(page);
-		goto out_put_swap;
-	}
-
-	if (READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE)
 		goto out_put_swap;
 
 	dst_pte = pte_offset_map(dst_pmd, dst_addr);
@@ -943,6 +934,14 @@ static int move_swap_pte(struct mm_struct *mm,
 		ret = -EEXIST;
 		goto out_unlock;
 	}
+	/*
+	 * Final swap-cache check under PTL: a concurrent swap-in may have
+	 * populated the cache between our entry validation and the PTE clear.
+	 * The PTL keeps SWAP_HAS_CACHE coherent with the PTE state we just
+	 * verified, so this single under-lock check is sufficient -- the
+	 * earlier lockless lookup_swap_cache()/swap_map probes were pure
+	 * optimization and are not required for correctness.
+	 */
 	if (unlikely(READ_ONCE(si->swap_map[offset]) & SWAP_HAS_CACHE))
 		goto out_unlock;
 
@@ -1033,20 +1032,18 @@ static ssize_t move_pages_pte(struct mm_struct *mm,
 	spinlock_t *dst_ptl, *src_ptl;
 	pte_t orig_dst_pte, orig_src_pte, moved_pte;
 	pte_t swap_src_pte = __pte(0);
-	struct page *page, *locked_retry_page;
-	unsigned int transient_retries;
-	bool copied, retry_same, try_swap_pte, wait_page_retry;
+	struct page *page, *src_page;
+	bool copied, try_swap_pte, wait_page_retry, src_page_locked;
 	ssize_t err = 0;
 
-	transient_retries = 0;
-	locked_retry_page = NULL;
+	src_page = NULL;
+	src_page_locked = false;
 
 retry_same_page:
 	dst_pte = NULL;
 	src_pte = NULL;
 	page = NULL;
 	copied = false;
-	retry_same = false;
 	try_swap_pte = false;
 	wait_page_retry = false;
 
@@ -1054,7 +1051,7 @@ retry_same_page:
 	src_pte = pte_offset_map(src_pmd, src_addr);
 	if (unlikely(!dst_pte || !src_pte)) {
 		err = -EFAULT;
-		goto out_unmap;
+		goto out_unlock_pt_nolock;
 	}
 
 	dst_ptl = pte_lockptr(mm, dst_pmd);
@@ -1104,45 +1101,38 @@ retry_same_page:
 		err = -EBUSY;
 		goto out_unlock_pt;
 	}
-	if (locked_retry_page) {
-		if (page != locked_retry_page) {
-			unlock_page(locked_retry_page);
-			put_page(locked_retry_page);
-			locked_retry_page = NULL;
-			if (transient_retries < UFFD_MOVE_TRANSIENT_RETRIES) {
-				transient_retries++;
-				retry_same = true;
-				err = 0;
-				goto out_unlock_pt;
-			}
+	/*
+	 * If we previously took a reference on a page and blocked on its
+	 * lock outside of the PTL, validate that the same page is still
+	 * mapped here. If not, surface EAGAIN so the outer loop retries
+	 * this address (which will either pick up the new page or report a
+	 * fresh error). src_page is already locked at this point.
+	 */
+	if (src_page_locked) {
+		if (page != src_page) {
 			err = -EAGAIN;
 			goto out_unlock_pt;
 		}
 	} else if (!trylock_page(page)) {
-		if (transient_retries < UFFD_MOVE_TRANSIENT_RETRIES) {
-			transient_retries++;
-			get_page(page);
-			locked_retry_page = page;
-			wait_page_retry = true;
-			err = 0;
-			goto out_unlock_pt;
-		}
-		err = -EAGAIN;
+		/*
+		 * Replaces the previous "limited retry then EAGAIN" scheme
+		 * that shared a single budget with the pte_same() recheck,
+		 * making any blocking page lock fall back to COPY in
+		 * userspace. Pin the page, drop the ptes, then block on
+		 * lock_page_killable() and retry. The retry's pte_same()
+		 * failure is reported as EAGAIN so the outer loop reruns
+		 * this address.
+		 */
+		get_page(page);
+		src_page = page;
+		wait_page_retry = true;
+		err = 0;
 		goto out_unlock_pt;
 	}
 	if (!pte_same(orig_src_pte, *src_pte) ||
 	    !pte_same(orig_dst_pte, *dst_pte)) {
 		unlock_page(page);
-		if (locked_retry_page) {
-			put_page(locked_retry_page);
-			locked_retry_page = NULL;
-		}
-		if (transient_retries < UFFD_MOVE_TRANSIENT_RETRIES) {
-			transient_retries++;
-			retry_same = true;
-			err = 0;
-			goto out_unlock_pt;
-		}
+		src_page_locked = false;
 		err = -EAGAIN;
 		goto out_unlock_pt;
 	}
@@ -1151,22 +1141,16 @@ retry_same_page:
 	if (unlikely(page_maybe_dma_pinned(page))) {
 		set_pte_at(mm, src_addr, src_pte, moved_pte);
 		unlock_page(page);
-		if (locked_retry_page) {
-			put_page(locked_retry_page);
-			locked_retry_page = NULL;
-		}
+		src_page_locked = false;
 		err = -EBUSY;
 		goto out_unlock_pt;
 	}
 	page_move_anon_rmap(page, dst_vma);
-	page->index = linear_page_index(dst_vma, dst_addr);
+	WRITE_ONCE(page->index, linear_page_index(dst_vma, dst_addr));
 	set_pte_at(mm, dst_addr, dst_pte, moved_pte);
 	update_mmu_cache(dst_vma, dst_addr, dst_pte);
 	unlock_page(page);
-	if (locked_retry_page) {
-		put_page(locked_retry_page);
-		locked_retry_page = NULL;
-	}
+	src_page_locked = false;
 	if (!*need_tlb_flush) {
 		*need_tlb_flush = true;
 		*tlb_flush_start = src_addr;
@@ -1176,29 +1160,35 @@ retry_same_page:
 
 out_unlock_pt:
 	uffd_double_pt_unlock(dst_ptl, src_ptl);
-out_unmap:
+out_unlock_pt_nolock:
 	if (src_pte)
 		pte_unmap(src_pte);
 	if (dst_pte)
 		pte_unmap(dst_pte);
 
 	if (wait_page_retry) {
-		err = lock_page_killable(locked_retry_page);
+		err = lock_page_killable(src_page);
 		if (err) {
-			put_page(locked_retry_page);
-			locked_retry_page = NULL;
+			put_page(src_page);
+			src_page = NULL;
 			goto out_done;
 		}
+		src_page_locked = true;
 		goto retry_same_page;
 	}
-	if (retry_same) {
-		cond_resched();
-		goto retry_same_page;
+	/*
+	 * Drop the page lock if we still hold it from a successful
+	 * lock_page_killable() above (only reachable on the EAGAIN
+	 * paths in the retry pass: page != src_page or pte_same()
+	 * failed). The fast path clears src_page_locked itself.
+	 */
+	if (src_page_locked) {
+		unlock_page(src_page);
+		src_page_locked = false;
 	}
-	if (locked_retry_page) {
-		unlock_page(locked_retry_page);
-		put_page(locked_retry_page);
-		locked_retry_page = NULL;
+	if (src_page) {
+		put_page(src_page);
+		src_page = NULL;
 	}
 
 	if (try_swap_pte) {
@@ -1260,9 +1250,9 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		goto out_unlock;
 
 	err = 0;
-	for (dst_addr = dst_start, src_addr = src_start;
-	     src_addr < src_start + len;
-	     dst_addr += PAGE_SIZE, src_addr += PAGE_SIZE) {
+	dst_addr = dst_start;
+	src_addr = src_start;
+	while (src_addr < src_start + len) {
 		pmd_t *dst_pmd, *src_pmd;
 		pmd_t dst_pmdval, src_pmdval;
 
@@ -1338,12 +1328,30 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		err = move_pages_pte(mm, dst_pmd, src_pmd, dst_vma, src_vma,
 				     dst_addr, src_addr, mode, &need_tlb_flush,
 				     &tlb_flush_start, &tlb_flush_end);
+		/*
+		 * Yield the CPU between PTEs. Long batches (ART CC GC can
+		 * move tens of MB in one ioctl) otherwise pin a CPU and
+		 * trigger soft-lockup warnings on PREEMPT_NONE/VOLUNTARY.
+		 */
+		cond_resched();
 		if (err == PAGE_SIZE) {
 			moved += PAGE_SIZE;
 			err = 0;
+		} else if (err == -EAGAIN) {
+			/*
+			 * Transient races: page lock contention, pte_same()
+			 * failed after we slept on the page lock, or the
+			 * folio was changed under us. Retry the same address
+			 * rather than aborting the whole batch and forcing
+			 * userspace to fall back to COPY.
+			 */
+			err = 0;
 			continue;
+		} else {
+			break;
 		}
-		break;
+		dst_addr += PAGE_SIZE;
+		src_addr += PAGE_SIZE;
 	}
 
 	if (need_tlb_flush)
