@@ -878,6 +878,18 @@ static inline bool vma_move_compatible(struct vm_area_struct *vma)
 	return !(vma->vm_flags & (VM_PFNMAP | VM_IO | VM_HUGETLB | VM_MIXEDMAP));
 }
 
+/*
+ * Bound how many times move_pages() retries a single address that keeps
+ * returning -EAGAIN (page-lock contention, or the source page changed
+ * under us while we blocked on its lock). A few retries absorb genuinely
+ * transient races without bouncing back to userspace; beyond that we stop
+ * spinning in the kernel and return the progress made so far, letting the
+ * caller (e.g. ART) fall back to a single-page COPY for the stuck address.
+ * Without this cap a page under sustained reclaim/migration pressure could
+ * stall the move loop for a long time.
+ */
+#define UFFD_MOVE_MAX_EAGAIN_RETRIES 3
+
 #ifdef CONFIG_SWAP
 static int move_swap_pte(struct mm_struct *mm,
 			 struct vm_area_struct *dst_vma,
@@ -1224,6 +1236,7 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 	bool need_tlb_flush = false;
 	struct mmu_notifier_range range;
 	bool notifier_active = false;
+	unsigned int eagain_retries = 0;
 
 	BUG_ON(dst_start & ~PAGE_MASK);
 	BUG_ON(src_start & ~PAGE_MASK);
@@ -1352,14 +1365,20 @@ ssize_t move_pages(struct mm_struct *mm, struct userfaultfd_ctx *ctx,
 		if (err == PAGE_SIZE) {
 			moved += PAGE_SIZE;
 			err = 0;
+			eagain_retries = 0;
 		} else if (err == -EAGAIN) {
 			/*
 			 * Transient races: page lock contention, pte_same()
 			 * failed after we slept on the page lock, or the
 			 * folio was changed under us. Retry the same address
-			 * rather than aborting the whole batch and forcing
-			 * userspace to fall back to COPY.
+			 * a bounded number of times rather than aborting the
+			 * whole batch on the first race. Once the cap is hit,
+			 * stop spinning in the kernel and return progress so
+			 * far with -EAGAIN so userspace can fall back to COPY
+			 * for the stuck address (see UFFD_MOVE_MAX_EAGAIN_RETRIES).
 			 */
+			if (++eagain_retries > UFFD_MOVE_MAX_EAGAIN_RETRIES)
+				break;
 			err = 0;
 			continue;
 		} else {
